@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+logs/
+raw_data/
+reports/
+niches/
+*.json
+credentials/
+.DS_Store
