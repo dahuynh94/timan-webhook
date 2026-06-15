@@ -169,22 +169,28 @@ def root():
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Deep health check — verifies DB connectivity."""
+    """Deep health check — verifies DB connectivity + latest SMS timestamp."""
     db_connected = False
+    latest_sms = None
     try:
         conn = get_connection()
         cur  = conn.cursor()
         cur.execute("SELECT 1")
         cur.fetchone()
+        cur.execute("SELECT created_at FROM sms_bank_log ORDER BY id DESC LIMIT 1")
+        row = cur.fetchone()
+        if row:
+            latest_sms = str(row[0])
         cur.close()
         conn.close()
         db_connected = True
     except Exception:
         pass
     return jsonify({
-        "status":       "healthy" if db_connected else "degraded",
-        "service":      "timan-sepay-webhook",
-        "db_connected": db_connected,
+        "status":                 "healthy" if db_connected else "degraded",
+        "service":                "timan-sepay-webhook",
+        "db_connected":           db_connected,
+        "latest_sms_received_at": latest_sms,
     }), 200
 
 
@@ -257,28 +263,85 @@ def sepay_webhook_probe():
 
 # ─── SMS Bank Log ─────────────────────────────────────────────────────────────
 
-def _parse_sms(text: str) -> dict | None:
-    """Parse bank SMS: 'Bank:DD/MM/YYYY HH:MM|TK:ACC|GD:±AMT VND|SDC:BAL VND|ND:DESC'"""
+def _migrate_sms_table() -> None:
+    """Add new columns to sms_bank_log if missing. Safe to run multiple times."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        for sql in [
+            "ALTER TABLE sms_bank_log ADD COLUMN sim VARCHAR(50) DEFAULT NULL AFTER bank",
+            "ALTER TABLE sms_bank_log ADD COLUMN direction ENUM('credit','debit') DEFAULT NULL AFTER balance",
+            "ALTER TABLE sms_bank_log ADD COLUMN description TEXT DEFAULT NULL AFTER direction",
+            "ALTER TABLE sms_bank_log ADD COLUMN raw_payload_json MEDIUMTEXT DEFAULT NULL",
+            "ALTER TABLE sms_bank_log ADD COLUMN parse_status VARCHAR(20) NOT NULL DEFAULT 'success'",
+            "ALTER TABLE sms_bank_log ADD COLUMN parse_error TEXT DEFAULT NULL",
+            "ALTER TABLE sms_bank_log ADD COLUMN txn_hash CHAR(64) DEFAULT NULL",
+        ]:
+            try:
+                cur.execute(sql)
+                conn.commit()
+            except Exception as e:
+                if "1060" not in str(e):
+                    log.warning("Migration: %s", e)
+        try:
+            cur.execute("ALTER TABLE sms_bank_log ADD UNIQUE KEY uq_txn_hash (txn_hash)")
+            conn.commit()
+        except Exception:
+            pass
+        cur.close()
+        conn.close()
+        log.info("sms_bank_log schema OK")
+    except Exception as exc:
+        log.warning("Migration skipped (DB not ready?): %s", exc)
+
+
+def _parse_sms(text: str) -> dict:
+    """Parse bank SMS. Always returns dict — never raises, never returns None."""
+    out = {
+        "parse_status": "failed", "parse_error": None,
+        "transaction_time": None, "account": None,
+        "amount": None, "balance": None, "direction": None, "description": None,
+    }
     try:
         parts = text.split("|")
         if len(parts) < 4:
-            return None
-        time_str = parts[0].split(":", 1)[1].strip() if ":" in parts[0] else ""
-        account  = parts[1].split(":", 1)[1].strip() if ":" in parts[1] else ""
-        amt_raw  = parts[2].split(":", 1)[1].strip() if ":" in parts[2] else ""
-        bal_raw  = parts[3].split(":", 1)[1].strip() if ":" in parts[3] else ""
-        desc     = parts[4].split(":", 1)[1].strip() if len(parts) > 4 and ":" in parts[4] else ""
-        is_credit = amt_raw.startswith("+")
-        amount   = int(re.sub(r"\D", "", amt_raw)) * (1 if is_credit else -1)
-        balance  = int(re.sub(r"\D", "", bal_raw))
-        return {"transaction_time": time_str, "account": account,
-                "amount": amount, "balance": balance, "description": desc}
-    except Exception:
-        return None
+            out["parse_error"] = f"Need ≥4 pipe-parts, got {len(parts)}"
+            return out
+        time_str   = parts[0].split(":", 1)[1].strip() if ":" in parts[0] else ""
+        account    = parts[1].split(":", 1)[1].strip() if ":" in parts[1] else ""
+        amt_raw    = parts[2].split(":", 1)[1].strip() if ":" in parts[2] else ""
+        bal_raw    = parts[3].split(":", 1)[1].strip() if ":" in parts[3] else ""
+        desc       = parts[4].split(":", 1)[1].strip() if len(parts) > 4 and ":" in parts[4] else ""
+        amt_digits = re.sub(r"\D", "", amt_raw)
+        bal_digits = re.sub(r"\D", "", bal_raw)
+        if not amt_digits:
+            out["parse_error"] = f"Cannot parse amount: {amt_raw!r}"
+            return out
+        is_credit = not amt_raw.strip().startswith("-")
+        out.update({
+            "parse_status":    "success",
+            "transaction_time": time_str,
+            "account":         account,
+            "amount":          int(amt_digits) * (1 if is_credit else -1),
+            "balance":         int(bal_digits) if bal_digits else None,
+            "direction":       "credit" if is_credit else "debit",
+            "description":     desc,
+        })
+    except Exception as exc:
+        out["parse_error"] = str(exc)
+    return out
+
+
+def _make_txn_hash(bank: str, account: str, amount, txn_time: str, original_msg: str) -> str:
+    """SHA-256 dedup key. Uses parsed fields when full, else hashes raw message."""
+    if account and amount is not None and txn_time:
+        raw = f"{bank}|{account}|{amount}|{txn_time}|{original_msg}"
+    else:
+        raw = original_msg
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _lark_token() -> str | None:
-    """Lấy tenant_access_token từ Lark."""
     if not _LARK_APP_ID or not _LARK_APP_SECRET:
         return None
     try:
@@ -295,7 +358,6 @@ def _lark_token() -> str | None:
 
 
 def _push_lark_bg(records: list) -> None:
-    """Đẩy records vào Lark Base — chạy trong background thread."""
     if not _LARK_SMS_BASE_ID or not _LARK_SMS_TABLE_ID:
         return
     token = _lark_token()
@@ -311,24 +373,28 @@ def _push_lark_bg(records: list) -> None:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=15) as r:
-            result = json.loads(r.read())
-            log.info("Lark push: code=%s", result.get("code"))
+            log.info("Lark push: code=%s", json.loads(r.read()).get("code"))
     except Exception as exc:
         log.error("Lark push error: %s", exc)
 
 
 def _insert_sms_log(conn, row: dict) -> int:
-    """INSERT vào sms_bank_log, trả về id mới."""
     cur = conn.cursor()
-    cur.execute(
-        """INSERT INTO sms_bank_log
-               (sms_uid, bank, account, amount, balance,
-                transaction_msg, original_msg, transaction_time, received_at_ms, is_otp)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
-        (row["sms_uid"], row["bank"], row.get("account"), row.get("amount"),
-         row.get("balance"), row.get("description"), row["original_msg"],
-         row.get("transaction_time"), row["received_at_ms"], row["is_otp"]),
-    )
+    cur.execute("""
+        INSERT INTO sms_bank_log
+            (sms_uid, bank, sim, account, amount, balance, direction,
+             description, transaction_msg, original_msg, transaction_time,
+             received_at_ms, raw_payload_json, parse_status, parse_error, txn_hash, is_otp)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+    """, (
+        row.get("sms_uid", ""), row.get("bank"), row.get("sim"),
+        row.get("account"), row.get("amount"), row.get("balance"), row.get("direction"),
+        row.get("description"), row.get("description"),
+        row.get("original_msg"), row.get("transaction_time"), row.get("received_at_ms"),
+        json.dumps(row.get("raw_payload"), ensure_ascii=False) if row.get("raw_payload") else None,
+        row.get("parse_status", "failed"), row.get("parse_error"),
+        row.get("txn_hash"), 1 if row.get("is_otp") else 0,
+    ))
     conn.commit()
     new_id = cur.lastrowid
     cur.close()
@@ -337,72 +403,106 @@ def _insert_sms_log(conn, row: dict) -> int:
 
 @app.route("/timan-sms-289", methods=["POST"])
 def sms_webhook():
-    """Nhận SMS forwarded từ điện thoại → MySQL + Lark Base song song.
+    """Nhận SMS từ điện thoại → parse → dedup → MySQL + Lark Base.
 
-    Body: {"text": "...", "from": "VietinBank", "sim": "...",
-           "sentStamp": ms, "receivedStamp": ms}
-    Hỗ trợ cả dạng nested {"body": {...}} (tương thích n8n test).
+    Supports flat {text, from, sim, receivedStamp}
+    and nested {body: {text, from, sim, receivedStamp}}.
+    Always returns 200. Always saves raw payload first.
     """
     payload = request.get_json(silent=True)
     if not payload:
-        return jsonify({"success": False, "error": "No JSON body"}), 400
+        return jsonify({"ok": False, "error": "No JSON body"}), 400
 
-    # support cả flat {"text":...} lẫn nested {"body":{"text":...}}
-    raw = payload.get("body") if isinstance(payload.get("body"), dict) else payload
+    raw         = payload.get("body") if isinstance(payload.get("body"), dict) else payload
     text        = str(raw.get("text", ""))
     bank        = str(raw.get("from", ""))
     sim         = str(raw.get("sim", ""))
     received_ms = int(raw.get("receivedStamp") or raw.get("sentStamp") or 0)
 
     is_otp = "OTP" in text.upper()
-    parsed = None if is_otp else _parse_sms(text)
+    parsed = (
+        {"parse_status": "success", "parse_error": None, "transaction_time": None,
+         "account": None, "amount": None, "balance": None, "direction": None, "description": text}
+        if is_otp else _parse_sms(text)
+    )
+
+    txn_hash = _make_txn_hash(
+        bank, parsed.get("account"), parsed.get("amount"),
+        parsed.get("transaction_time"), text,
+    )
 
     row = {
-        "sms_uid":      f"{sim}-{received_ms}",
-        "bank":         bank,
-        "original_msg": text,
-        "received_at_ms": received_ms,
-        "is_otp":       1 if is_otp else 0,
-        **(parsed or {}),
+        "sms_uid": f"{sim}-{received_ms}", "bank": bank, "sim": sim,
+        "original_msg": text, "received_at_ms": received_ms,
+        "is_otp": is_otp, "raw_payload": raw, "txn_hash": txn_hash,
+        **parsed,
     }
 
-    # ── MySQL ─────────────────────────────────────────────────────────────────
     new_id = None
+    inserted = False
+
     try:
         conn = get_connection()
         try:
+            cur = conn.cursor()
+            cur.execute("SELECT id FROM sms_bank_log WHERE txn_hash = %s", (txn_hash,))
+            if cur.fetchone():
+                cur.close()
+                log.info("SMS duplicate hash=%s", txn_hash[:12])
+                return jsonify({"ok": True, "inserted": False, "parse_status": "duplicate"}), 200
+            cur.close()
             new_id = _insert_sms_log(conn, row)
-            log.info("SMS log id=%s bank=%s amount=%s is_otp=%s",
-                     new_id, bank, row.get("amount"), is_otp)
+            inserted = True
+            log.info("SMS id=%s bank=%s account=%s amount=%s parse=%s is_otp=%s",
+                     new_id, bank, parsed.get("account"), parsed.get("amount"),
+                     parsed.get("parse_status"), is_otp)
         finally:
             conn.close()
     except Exception as exc:
         log.exception("SMS MySQL error: %s", exc)
 
-    # ── Lark Base (background, không block response) ──────────────────────────
-    if is_otp:
-        lark_fields = {
-            "ID": bank, "Bank": bank, "Transaction Type": "OTP",
-            "Transaction Message": text, "Original Message": text,
-            "Time received": received_ms,
-        }
-    else:
-        lark_fields = {
-            "ID":                  f"{sim}-{row.get('account', '')}",
-            "Bank":                bank,
-            "Account":             row.get("account"),
-            "Amount":              row.get("amount"),
-            "Balance":             row.get("balance"),
-            "Transaction Message": row.get("description"),
-            "Original Message":    text,
-            "Transaction Time":    row.get("transaction_time"),
-            "Time received":       received_ms,
-        }
-    threading.Thread(
-        target=_push_lark_bg, args=([{"fields": lark_fields}],), daemon=True,
-    ).start()
+    if inserted:
+        lark_fields = (
+            {"ID": bank, "Bank": bank, "Transaction Type": "OTP",
+             "Transaction Message": text, "Original Message": text, "Time received": received_ms}
+            if is_otp else
+            {"ID": f"{sim}-{parsed.get('account', '')}", "Bank": bank,
+             "Account": parsed.get("account"), "Amount": parsed.get("amount"),
+             "Balance": parsed.get("balance"), "Transaction Message": parsed.get("description"),
+             "Original Message": text, "Transaction Time": parsed.get("transaction_time"),
+             "Time received": received_ms}
+        )
+        threading.Thread(target=_push_lark_bg, args=([{"fields": lark_fields}],), daemon=True).start()
 
-    return jsonify({"success": True, "id": new_id, "is_otp": is_otp}), 200
+    return jsonify({
+        "ok":           True,
+        "inserted":     inserted,
+        "parse_status": parsed.get("parse_status", "failed"),
+    }), 200
+
+
+@app.route("/sms/recent", methods=["GET"])
+def sms_recent():
+    """Debug: xem SMS gần nhất. ?limit=N (max 100)."""
+    limit = min(int(request.args.get("limit", 10)), 100)
+    try:
+        conn = get_connection()
+        cur  = conn.cursor(dictionary=True)
+        cur.execute("""
+            SELECT id, bank, sim, account, amount, balance, direction,
+                   parse_status, parse_error, transaction_time, is_otp, created_at
+            FROM sms_bank_log ORDER BY id DESC LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "ok": True, "count": len(rows),
+            "records": [{**r, "created_at": str(r["created_at"])} for r in rows],
+        }), 200
+    except Exception as exc:
+        log.exception("sms/recent error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 # ─── audit log endpoint (xem webhook history) ────────────────────────────────
@@ -420,6 +520,8 @@ def sepay_logs():
 
 
 # ─── main ────────────────────────────────────────────────────────────────────
+
+_migrate_sms_table()
 
 if __name__ == "__main__":
     port = int(os.getenv("SEPAY_WEBHOOK_PORT", "5055"))
