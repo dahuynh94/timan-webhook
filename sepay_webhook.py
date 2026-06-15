@@ -29,7 +29,10 @@ import io
 import json
 import logging
 import os
+import re
 import sys
+import threading
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -79,6 +82,12 @@ _WEBHOOK_API_KEY    = os.getenv("SEPAY_WEBHOOK_API_KEY", "")
 _WEBHOOK_SECRET     = os.getenv("SEPAY_WEBHOOK_SECRET", "")
 _IP_WHITELIST_RAW   = os.getenv("SEPAY_IP_WHITELIST", "")
 _IP_WHITELIST: set  = {ip.strip() for ip in _IP_WHITELIST_RAW.split(",") if ip.strip()}
+
+# ─── Lark Base (SMS log) ─────────────────────────────────────────────────────
+_LARK_APP_ID    = os.getenv("LARK_APP_ID", "")
+_LARK_APP_SECRET = os.getenv("LARK_APP_SECRET", "")
+_LARK_SMS_BASE_ID  = os.getenv("LARK_SMS_BASE_ID", "")
+_LARK_SMS_TABLE_ID = os.getenv("LARK_SMS_TABLE_ID", "")
 
 # SePay official IPs (as documented at docs.sepay.vn/tich-hop-webhooks.html)
 # Add to SEPAY_IP_WHITELIST in .env to enforce strict IP filtering
@@ -244,6 +253,156 @@ def sepay_webhook():
 def sepay_webhook_probe():
     """SePay gọi GET để kiểm tra endpoint tồn tại."""
     return jsonify({"success": True, "message": "SePay webhook endpoint sẵn sàng"}), 200
+
+
+# ─── SMS Bank Log ─────────────────────────────────────────────────────────────
+
+def _parse_sms(text: str) -> dict | None:
+    """Parse bank SMS: 'Bank:DD/MM/YYYY HH:MM|TK:ACC|GD:±AMT VND|SDC:BAL VND|ND:DESC'"""
+    try:
+        parts = text.split("|")
+        if len(parts) < 4:
+            return None
+        time_str = parts[0].split(":", 1)[1].strip() if ":" in parts[0] else ""
+        account  = parts[1].split(":", 1)[1].strip() if ":" in parts[1] else ""
+        amt_raw  = parts[2].split(":", 1)[1].strip() if ":" in parts[2] else ""
+        bal_raw  = parts[3].split(":", 1)[1].strip() if ":" in parts[3] else ""
+        desc     = parts[4].split(":", 1)[1].strip() if len(parts) > 4 and ":" in parts[4] else ""
+        is_credit = amt_raw.startswith("+")
+        amount   = int(re.sub(r"\D", "", amt_raw)) * (1 if is_credit else -1)
+        balance  = int(re.sub(r"\D", "", bal_raw))
+        return {"transaction_time": time_str, "account": account,
+                "amount": amount, "balance": balance, "description": desc}
+    except Exception:
+        return None
+
+
+def _lark_token() -> str | None:
+    """Lấy tenant_access_token từ Lark."""
+    if not _LARK_APP_ID or not _LARK_APP_SECRET:
+        return None
+    try:
+        body = json.dumps({"app_id": _LARK_APP_ID, "app_secret": _LARK_APP_SECRET}).encode()
+        req = urllib.request.Request(
+            "https://open.larksuite.com/open-apis/auth/v3/tenant_access_token/internal/",
+            data=body, headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read()).get("tenant_access_token")
+    except Exception as exc:
+        log.error("Lark token error: %s", exc)
+        return None
+
+
+def _push_lark_bg(records: list) -> None:
+    """Đẩy records vào Lark Base — chạy trong background thread."""
+    if not _LARK_SMS_BASE_ID or not _LARK_SMS_TABLE_ID:
+        return
+    token = _lark_token()
+    if not token:
+        return
+    try:
+        url = (f"https://open.larksuite.com/open-apis/bitable/v1/apps/"
+               f"{_LARK_SMS_BASE_ID}/tables/{_LARK_SMS_TABLE_ID}/records/batch_create")
+        body = json.dumps({"records": records}).encode()
+        req = urllib.request.Request(
+            url, data=body,
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {token}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            result = json.loads(r.read())
+            log.info("Lark push: code=%s", result.get("code"))
+    except Exception as exc:
+        log.error("Lark push error: %s", exc)
+
+
+def _insert_sms_log(conn, row: dict) -> int:
+    """INSERT vào sms_bank_log, trả về id mới."""
+    cur = conn.cursor()
+    cur.execute(
+        """INSERT INTO sms_bank_log
+               (sms_uid, bank, account, amount, balance,
+                transaction_msg, original_msg, transaction_time, received_at_ms, is_otp)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+        (row["sms_uid"], row["bank"], row.get("account"), row.get("amount"),
+         row.get("balance"), row.get("description"), row["original_msg"],
+         row.get("transaction_time"), row["received_at_ms"], row["is_otp"]),
+    )
+    conn.commit()
+    new_id = cur.lastrowid
+    cur.close()
+    return new_id
+
+
+@app.route("/timan-sms-289", methods=["POST"])
+def sms_webhook():
+    """Nhận SMS forwarded từ điện thoại → MySQL + Lark Base song song.
+
+    Body: {"text": "...", "from": "VietinBank", "sim": "...",
+           "sentStamp": ms, "receivedStamp": ms}
+    Hỗ trợ cả dạng nested {"body": {...}} (tương thích n8n test).
+    """
+    payload = request.get_json(silent=True)
+    if not payload:
+        return jsonify({"success": False, "error": "No JSON body"}), 400
+
+    # support cả flat {"text":...} lẫn nested {"body":{"text":...}}
+    raw = payload.get("body") if isinstance(payload.get("body"), dict) else payload
+    text        = str(raw.get("text", ""))
+    bank        = str(raw.get("from", ""))
+    sim         = str(raw.get("sim", ""))
+    received_ms = int(raw.get("receivedStamp") or raw.get("sentStamp") or 0)
+
+    is_otp = "OTP" in text.upper()
+    parsed = None if is_otp else _parse_sms(text)
+
+    row = {
+        "sms_uid":      f"{sim}-{received_ms}",
+        "bank":         bank,
+        "original_msg": text,
+        "received_at_ms": received_ms,
+        "is_otp":       1 if is_otp else 0,
+        **(parsed or {}),
+    }
+
+    # ── MySQL ─────────────────────────────────────────────────────────────────
+    new_id = None
+    try:
+        conn = get_connection()
+        try:
+            new_id = _insert_sms_log(conn, row)
+            log.info("SMS log id=%s bank=%s amount=%s is_otp=%s",
+                     new_id, bank, row.get("amount"), is_otp)
+        finally:
+            conn.close()
+    except Exception as exc:
+        log.exception("SMS MySQL error: %s", exc)
+
+    # ── Lark Base (background, không block response) ──────────────────────────
+    if is_otp:
+        lark_fields = {
+            "ID": bank, "Bank": bank, "Transaction Type": "OTP",
+            "Transaction Message": text, "Original Message": text,
+            "Time received": received_ms,
+        }
+    else:
+        lark_fields = {
+            "ID":                  f"{sim}-{row.get('account', '')}",
+            "Bank":                bank,
+            "Account":             row.get("account"),
+            "Amount":              row.get("amount"),
+            "Balance":             row.get("balance"),
+            "Transaction Message": row.get("description"),
+            "Original Message":    text,
+            "Transaction Time":    row.get("transaction_time"),
+            "Time received":       received_ms,
+        }
+    threading.Thread(
+        target=_push_lark_bg, args=([{"fields": lark_fields}],), daemon=True,
+    ).start()
+
+    return jsonify({"success": True, "id": new_id, "is_otp": is_otp}), 200
 
 
 # ─── audit log endpoint (xem webhook history) ────────────────────────────────
