@@ -148,10 +148,35 @@ def _get_client_ip(req) -> str:
 
 # ─── endpoints ────────────────────────────────────────────────────────────────
 
+@app.route("/", methods=["GET"])
+def root():
+    """Root endpoint — Render health probe + browser check."""
+    return jsonify({
+        "status":  "ok",
+        "service": "timan-sepay-webhook",
+        "uptime":  "running",
+    }), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    """Health check — dùng để monitor uptime."""
-    return jsonify({"status": "ok", "service": "sepay-webhook", "ts": datetime.now().isoformat()}), 200
+    """Deep health check — verifies DB connectivity."""
+    db_connected = False
+    try:
+        conn = get_connection()
+        cur  = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        conn.close()
+        db_connected = True
+    except Exception:
+        pass
+    return jsonify({
+        "status":       "healthy" if db_connected else "degraded",
+        "service":      "timan-sepay-webhook",
+        "db_connected": db_connected,
+    }), 200
 
 
 @app.route("/sepay/webhook", methods=["POST"])
